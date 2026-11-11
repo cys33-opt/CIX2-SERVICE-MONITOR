@@ -522,7 +522,17 @@ def _build_loop_html(hdr_list, dtl_list, eta_rows=None):
     )
 
 
-def _crawl_via_requests(loop_code, include_vessel_eta, report):
+def _fmt_ymd(val):
+    """날짜 객체 또는 문자열을 'YYYYMMDD' 8자리 문자열로 변환한다."""
+    if val is None or val == "":
+        return ""
+    if hasattr(val, "strftime"):
+        return val.strftime("%Y%m%d")
+    digits = re.sub(r"\D", "", str(val))
+    return digits[:8]
+
+
+def _crawl_via_requests(loop_code, include_vessel_eta, report, date_from=None, date_to=None):
     """requests.Session 으로 CSRF 토큰을 발급받아 빠르게 방식 A + 방식 B JSON API 를 호출한다."""
     from datetime import timedelta
     import requests
@@ -554,8 +564,8 @@ def _crawl_via_requests(loop_code, include_vessel_eta, report):
     }
 
     now = datetime.now()
-    from_str = now.strftime("%Y%m%d")
-    to_str = (now + timedelta(days=92)).strftime("%Y%m%d")
+    from_str = _fmt_ymd(date_from) or now.strftime("%Y%m%d")
+    to_str = _fmt_ymd(date_to) or (now + timedelta(days=92)).strftime("%Y%m%d")
 
     report(15, 100, f"[방식 A] Long-term Schedule by Loop ({loop_code}) API 조회 중...")
     loop_resp = sess.post(
@@ -628,13 +638,19 @@ def _crawl_via_requests(loop_code, include_vessel_eta, report):
 
 
 def crawl_hmm_schedule(loop_code="FIM", include_vessel_eta=True,
-                       save_dir=HERE / "snapshots", on_progress=None, headless=True):
+                       save_dir=HERE / "snapshots", on_progress=None, headless=True,
+                       date_from=None, date_to=None):
     """HMM e-Service 에 실제 Chrome(Playwright)으로 접속하여(Akamai TLS/봇 차단 통과):
     1) [방식 A] Long-term Schedule by Loop (FIM) 조회 및 테이블 생성
     2) [방식 B] (include_vessel_eta=True 시) 조회된 모선 순서대로 by Vessel Name API 를 호출해
        선박별 ETA(Arrival) · ETB · ETD 상세 데이터를 수집하여 HTML 내부에 함께 저장한다.
     """
     from playwright.sync_api import sync_playwright
+
+    from_ymd = _fmt_ymd(date_from)
+    to_ymd = _fmt_ymd(date_to)
+    if from_ymd and to_ymd and from_ymd > to_ymd:
+        raise ValueError(f"시작 날짜({from_ymd})가 끝 날짜({to_ymd})보다 늦을 수 없습니다.")
 
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -703,12 +719,12 @@ def crawl_hmm_schedule(loop_code="FIM", include_vessel_eta=True,
             raise RuntimeError("HMM e-Service 페이지에 접속할 수 없습니다 (네트워크 또는 브라우저 확인).")
 
         try:
-
-            report(15, 100, f"[방식 A] Long-term Schedule by Loop ({loop_code}) 조회 중...")
+            period_lbl = f"{from_ymd or '오늘'} ~ {to_ymd or '+3개월'}"
+            report(15, 100, f"[방식 A] Long-term Schedule by Loop ({loop_code}, {period_lbl}) 조회 중...")
             loop_res = page.evaluate(
-                """async (loopCode) => {
-                    const fromDt = fnToday('yyyy-mm-dd').replaceAll('-', '');
-                    const toDt = fnCalcMonth(3).replaceAll('-', '');
+                """async ({ loopCode, dateFrom, dateTo }) => {
+                    const fromDt = dateFrom || fnToday('yyyy-mm-dd').replaceAll('-', '');
+                    const toDt = dateTo || fnCalcMonth(3).replaceAll('-', '');
                     const reqObj = {
                         srchByLoopOptLoop: loopCode,
                         srchLongDateFrom: fromDt,
@@ -738,7 +754,7 @@ def crawl_hmm_schedule(loop_code="FIM", include_vessel_eta=True,
                     }
                     return { hdrList, dtlList, vessels };
                 }""",
-                loop_code,
+                {"loopCode": loop_code, "dateFrom": from_ymd, "dateTo": to_ymd},
             )
 
             hdr_list = loop_res.get("hdrList") or []

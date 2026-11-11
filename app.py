@@ -1,4 +1,5 @@
 """FIM 항로 스케줄 모니터 — 실행: streamlit run app.py"""
+from datetime import datetime, timedelta
 import importlib
 from pathlib import Path
 
@@ -14,6 +15,9 @@ fs.normalize_snapshot_filenames(SNAP_DIR)
 
 st.set_page_config(page_title="FIM 스케줄 모니터", layout="wide")
 
+TODAY = datetime.now().date()
+DEFAULT_TO = TODAY + timedelta(days=92)
+
 
 @st.cache_data
 def load(path, mtime, _ver=2):  # mtime: 파일이 바뀌면 캐시 무효화
@@ -24,23 +28,34 @@ def load(path, mtime, _ver=2):  # mtime: 파일이 바뀌면 캐시 무효화
 with st.sidebar:
     st.header("🔄 HMM 자동 크롤링")
     st.caption("A: FIM 항로(Loop) 전체 표 수집  \nB: 모선별 개별 조회로 ETA(Arrival)까지 함께 수집")
+    d_col1, d_col2 = st.columns(2)
+    sb_from = d_col1.date_input("시작 날짜", value=st.session_state.get("crawl_from", TODAY), key="sb_from_dt")
+    sb_to = d_col2.date_input("끝 날짜", value=st.session_state.get("crawl_to", DEFAULT_TO), key="sb_to_dt")
+    st.session_state["crawl_from"] = sb_from
+    st.session_state["crawl_to"] = sb_to
+
     col_a, col_b = st.columns(2)
     run_a = col_a.button("1️⃣ 방식 A\n(Loop만)", use_container_width=True, help="Long-term Schedule by Loop (FIM) 표만 빠르게 가져옵니다.")
     run_ab = col_b.button("2️⃣ 방식 A+B\n(Loop+ETA)", type="primary", use_container_width=True, help="FIM 항로 표 조회 후 모선별로 ETA(Arrival)까지 모두 크롤링합니다.")
 
     if run_a or run_ab:
-        prog = st.progress(0, text="크롤링 준비 중...")
-        try:
-            saved_path = fs.crawl_hmm_schedule(
-                loop_code="FIM",
-                include_vessel_eta=bool(run_ab),
-                save_dir=SNAP_DIR,
-                on_progress=lambda step, total, msg: prog.progress(min(int(step * 100 / max(total, 1)), 100), text=msg),
-            )
-            st.success(f"크롤링 및 저장 완료: {saved_path.name}")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"크롤링 실패: {exc}")
+        if sb_from > sb_to:
+            st.error("시작 날짜는 끝 날짜보다 늦을 수 없습니다.")
+        else:
+            prog = st.progress(0, text="크롤링 준비 중...")
+            try:
+                saved_path = fs.crawl_hmm_schedule(
+                    loop_code="FIM",
+                    include_vessel_eta=bool(run_ab),
+                    save_dir=SNAP_DIR,
+                    on_progress=lambda step, total, msg: prog.progress(min(int(step * 100 / max(total, 1)), 100), text=msg),
+                    date_from=sb_from,
+                    date_to=sb_to,
+                )
+                st.success(f"크롤링 및 저장 완료: {saved_path.name}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"크롤링 실패: {exc}")
 
     st.divider()
     st.header("스냅샷")
@@ -86,7 +101,9 @@ c[3].metric("변경 건수", "-" if changes is None else len(changes))
 
 STATUS_COLOR = {"actual": "background-color:#d9f2e3", "coastal": "background-color:#fff4cc"}
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["선박 현황", "스케줄", "변경 내역", "입력용 (CIX2)", "코드 관리"])
+tab1, tab2, tab3, tab4, tab5, tab_crawl = st.tabs([
+    "선박 현황", "스케줄", "변경 내역", "입력용 (CIX2)", "코드 관리", "🔄 자동 크롤링"
+])
 
 all_voyages = list(dict.fromkeys(zip(df["vessel"], df["voyage"])))
 
@@ -281,3 +298,92 @@ with tab5:
         p_edit[filled(p_edit["locode"]) & filled(p_edit["wharf"])].to_csv(PORT_CODES, index=False)
         st.toast("코드를 저장했습니다.")
         st.rerun()
+
+with tab_crawl:
+    st.subheader("🔄 HMM 스케줄 자동 크롤링 (기간 지정)")
+    st.caption(
+        "HMM e-Service (`ScheduleMain.do`)에서 **시작 날짜 ~ 끝 날짜** 기간의 FIM 항로 스케줄을 자동으로 수집하여 스냅샷으로 저장합니다."
+    )
+
+    with st.container(border=True):
+        st.markdown("##### 📅 조회 기간 선택")
+        p1, p2, p3, p4 = st.columns(4)
+        if p1.button("오늘 ~ +1개월", use_container_width=True, key="preset_1m"):
+            st.session_state["tab_from_dt"] = TODAY
+            st.session_state["tab_to_dt"] = TODAY + timedelta(days=31)
+            st.rerun()
+        if p2.button("오늘 ~ +2개월", use_container_width=True, key="preset_2m"):
+            st.session_state["tab_from_dt"] = TODAY
+            st.session_state["tab_to_dt"] = TODAY + timedelta(days=62)
+            st.rerun()
+        if p3.button("오늘 ~ +3개월 (기본)", use_container_width=True, key="preset_3m"):
+            st.session_state["tab_from_dt"] = TODAY
+            st.session_state["tab_to_dt"] = DEFAULT_TO
+            st.rerun()
+        if p4.button("오늘 ~ +6개월", use_container_width=True, key="preset_6m"):
+            st.session_state["tab_from_dt"] = TODAY
+            st.session_state["tab_to_dt"] = TODAY + timedelta(days=183)
+            st.rerun()
+
+        dc1, dc2 = st.columns(2)
+        t_from = dc1.date_input(
+            "시작 날짜 (From)",
+            value=st.session_state.get("tab_from_dt", sb_from),
+            key="tab_from_dt",
+        )
+        t_to = dc2.date_input(
+            "끝 날짜 (To)",
+            value=st.session_state.get("tab_to_dt", sb_to),
+            key="tab_to_dt",
+        )
+        days_diff = (t_to - t_from).days
+        if days_diff >= 0:
+            st.info(f"선택된 조회 기간: **{t_from:%Y-%m-%d}** ~ **{t_to:%Y-%m-%d}** (총 **{days_diff + 1}일**)")
+        else:
+            st.error("시작 날짜가 끝 날짜보다 늦습니다. 날짜를 다시 선택해 주세요.")
+
+        bc1, bc2 = st.columns(2)
+        t_run_a = bc1.button(
+            "1️⃣ 방식 A 크롤링 시작 (FIM Loop 표만 빠르게 수집)",
+            use_container_width=True,
+            disabled=days_diff < 0,
+            key="tab_btn_a",
+        )
+        t_run_ab = bc2.button(
+            "2️⃣ 방식 A+B 크롤링 시작 (FIM Loop + 모선별 ETA 전체 수집)",
+            type="primary",
+            use_container_width=True,
+            disabled=days_diff < 0,
+            key="tab_btn_ab",
+        )
+
+        if t_run_a or t_run_ab:
+            t_prog = st.progress(0, text="크롤링 준비 중...")
+            try:
+                saved_path = fs.crawl_hmm_schedule(
+                    loop_code="FIM",
+                    include_vessel_eta=bool(t_run_ab),
+                    save_dir=SNAP_DIR,
+                    on_progress=lambda step, total, msg: t_prog.progress(
+                        min(int(step * 100 / max(total, 1)), 100), text=msg
+                    ),
+                    date_from=t_from,
+                    date_to=t_to,
+                )
+                st.success(f"크롤링 및 저장 완료: {saved_path.name}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"크롤링 실패: {exc}")
+
+    st.subheader("📂 저장된 스냅샷 목록")
+    snap_rows = [
+        {
+            "파일명": f.name,
+            "기준일자": f"{fs.snapshot_date(f):%Y-%m-%d}",
+            "수정시각": f"{datetime.fromtimestamp(f.stat().st_mtime):%Y-%m-%d %H:%M:%S}",
+            "크기 (KB)": round(f.stat().st_size / 1024, 1),
+        }
+        for f in files
+    ]
+    st.dataframe(pd.DataFrame(snap_rows), hide_index=True, width="stretch")
+
