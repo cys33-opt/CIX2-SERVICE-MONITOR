@@ -80,6 +80,8 @@ df = load(str(cur), cur.stat().st_mtime)
 status = fs.vessel_status(df)
 status["구분"] = status["state"].str.replace(r" \(.*\)$", "", regex=True)
 changes = fs.diff_snapshots(load(str(prev), prev.stat().st_mtime), df) if prev else None
+if changes is not None:
+    changes["hours"] = pd.to_numeric(changes["hours"], errors="coerce").astype("float64")
 
 st.title("FIM 항로 스케줄 모니터")
 st.caption(f"Far East India Mediterranean [FIM] · 기준 {fs.snapshot_date(cur):%Y-%m-%d}")
@@ -181,6 +183,8 @@ with tab3:
                                           "port": r.port, "field": r.field,
                                           "old": fmt_val(r.old), "new": fmt_val(r.new), "hours": r.hours})
             view = pd.DataFrame(tab3_rows)
+            view["seq"] = pd.to_numeric(view["seq"], errors="coerce").astype("float64")
+            view["hours"] = pd.to_numeric(view["hours"], errors="coerce").astype("float64")
             color = lambda h: "" if pd.isna(h) else ("color:#c0392b" if h > 0 else "color:#2471a3")
             st.dataframe(view.style.map(color, subset=["hours"]).format({"hours": "{:+.1f}h", "seq": "{:.0f}"}, na_rep=""),
                          hide_index=True, width="stretch")

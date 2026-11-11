@@ -258,7 +258,9 @@ def diff_snapshots(old, new):
     m = occ(old).merge(occ(new), on=key, how="outer", suffixes=("_old", "_new"), indicator=True)
     m = m[[(r.vessel, r.voyage) in common for r in m.itertuples()]]
     if m.empty:
-        return pd.DataFrame(columns=["vessel", "voyage", "seq", "port", "field", "old", "new", "hours"])
+        res = pd.DataFrame(columns=["vessel", "voyage", "seq", "port", "field", "old", "new", "hours"])
+        res["hours"] = res["hours"].astype("float64")
+        return res
     m["seq"] = m["seq_new"].fillna(m["seq_old"]).astype(int)
     vv_order = {vv: i for i, vv in enumerate(dict.fromkeys(zip(new["vessel"], new["voyage"])))}
     m["_vv"] = [vv_order.get((r.vessel, r.voyage), len(vv_order)) for r in m.itertuples()]
@@ -271,21 +273,23 @@ def diff_snapshots(old, new):
         if r["_merge"] != "both":
             added = r["_merge"] == "right_only"
             changes.append({**base, "field": "기항", "old": "없음" if added else "있음",
-                            "new": "있음" if added else "없음", "hours": None})
+                            "new": "있음" if added else "없음", "hours": float("nan")})
             continue
         if bool(r["skip_old"]) != bool(r["skip_new"]):
-            changes.append({**base, "field": "SKIP", "old": r["skip_old"], "new": r["skip_new"], "hours": None})
+            changes.append({**base, "field": "SKIP", "old": r["skip_old"], "new": r["skip_new"], "hours": float("nan")})
         fields = ("eta", "etb", "etd") if ("eta_old" in r and "eta_new" in r) else ("etb", "etd")
         for f in fields:
             o, n = r[f"{f}_old"], r[f"{f}_new"]
             if pd.isna(o) and pd.isna(n):
                 continue
-            if f == "eta" and not has_eta_both and (pd.isna(o) or pd.isna(n)):
+            if f == "eta" and (pd.isna(o) or pd.isna(n)):
                 continue
             if pd.isna(o) or pd.isna(n) or o != n:
-                hours = None if pd.isna(o) or pd.isna(n) else (n - o).total_seconds() / 3600
+                hours = float("nan") if pd.isna(o) or pd.isna(n) else (n - o).total_seconds() / 3600
                 changes.append({**base, "field": f.upper(), "old": o, "new": n, "hours": hours})
-    return pd.DataFrame(changes, columns=["vessel", "voyage", "seq", "port", "field", "old", "new", "hours"])
+    res = pd.DataFrame(changes, columns=["vessel", "voyage", "seq", "port", "field", "old", "new", "hours"])
+    res["hours"] = pd.to_numeric(res["hours"], errors="coerce").astype("float64")
+    return res
 
 
 HERE = Path(__file__).parent
