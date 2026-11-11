@@ -21,10 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps chromium
 
 COPY . .
-
-# Windows gcloud 업로드 시 한글 파일명(CP949)을 UTF-8로 자동 보정
-RUN python -c "import os, pathlib; p = pathlib.Path('snapshots'); \
-[f.rename(p / os.fsencode(f.name).decode('cp949')) for f in list(p.iterdir()) if p.exists() and not f.name.isascii() and any(0xDC80 <= ord(c) <= 0xDCFF for c in f.name)]"
+RUN python -c "import fim_schedule; fim_schedule.normalize_snapshot_filenames('snapshots')"
 
 EXPOSE 8080
 

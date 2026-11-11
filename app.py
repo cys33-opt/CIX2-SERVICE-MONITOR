@@ -10,6 +10,7 @@ importlib.reload(fs)
 
 SNAP_DIR = Path(__file__).parent / "snapshots"
 SNAP_DIR.mkdir(exist_ok=True)
+fs.normalize_snapshot_filenames(SNAP_DIR)
 
 st.set_page_config(page_title="FIM 스케줄 모니터", layout="wide")
 

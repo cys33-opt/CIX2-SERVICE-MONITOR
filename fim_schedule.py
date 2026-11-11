@@ -185,6 +185,24 @@ def parse_html(path):
     return df
 
 
+def normalize_snapshot_filenames(snap_dir):
+    """Windows zip 업로드 시 깨진 한글 파일명을 UTF-8('월', '일')로 자동 복원한다."""
+    p = Path(snap_dir)
+    if not p.exists():
+        return
+    for f in list(p.iterdir()):
+        safe_name = f.name.encode("utf-8", "replace").decode("utf-8")
+        m = re.match(r"^((?:\d{4}\s+)?\d{1,2})[^\d\s]+\s+(\d{1,2})[^\d_]+(_\d+)?\.html$", safe_name)
+        if m:
+            suffix = m.group(3) or ""
+            target_name = f"{m.group(1)}월 {m.group(2)}일{suffix}.html"
+            if f.name != target_name:
+                try:
+                    f.rename(p / target_name)
+                except Exception:
+                    pass
+
+
 def snapshot_date(path):
     """파일명 '2026 11월 3일.html' → datetime(2026, 11, 3). 없으면 파일 수정시각."""
     m = re.search(r"(\d{4})\D*?(\d{1,2})월\s*(\d{1,2})일", Path(path).stem)
