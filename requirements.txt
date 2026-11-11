@@ -1,0 +1,5 @@
+streamlit
+pandas
+playwright
+requests
+pytest
