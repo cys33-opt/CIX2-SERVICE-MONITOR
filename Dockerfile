@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps chromium
 
 COPY . .
-RUN python -c "import fim_schedule; fim_schedule.normalize_snapshot_filenames('snapshots')"
+RUN python -c "import tarfile, pathlib; p = pathlib.Path('snapshots_bundle.tar.gz'); (tarfile.open(p, 'r:gz', encoding='utf-8').extractall('.') or p.unlink()) if p.exists() else None"
 
 EXPOSE 8080
 
