@@ -71,8 +71,12 @@ def _to_dt(text):
     return datetime.strptime(m.group(0), "%Y-%m-%d %H:%M") if m else None
 
 
+def _norm_tmnl(text):
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
 def _extract_vessel_eta_records(html_text):
-    """저장된 HTML 내 JSON 스크립트(#hmm-vessel-eta-data) 또는 #byVesselNameTable 에서 ETA 정보를 추출한다."""
+    """저장된 HTML 내 JSON 스크립트(#hmm-vessel-eta-data) 또는 #byVesselNameTable 에서 ETA/ETB/ETD 정보를 추출한다."""
     records = []
     m_json = re.search(
         r'<script[^>]*id=["\']hmm-vessel-eta-data["\'][^>]*>(.*?)</script>',
@@ -93,6 +97,11 @@ def _extract_vessel_eta_records(html_text):
                     "terminal": str(it.get("tmnlNm") or "").strip(),
                     "eta": _to_dt(it.get("arrDt")),
                     "eta_status": (it.get("arrStNm") or None),
+                    "etb": _to_dt(it.get("berDt")),
+                    "etb_status": (it.get("berStNm") or None),
+                    "etd": _to_dt(it.get("depDt")),
+                    "etd_status": (it.get("depStNm") or None),
+                    "update_etb_etd": bool(it.get("_update_etb_etd")),
                 })
         except Exception:
             pass
@@ -113,8 +122,9 @@ def _extract_vessel_eta_records(html_text):
                 port_nm = re.sub(r"\s+", " ", clean(tds[2])).strip()
                 tmnl_nm = re.sub(r"\s+", " ", clean(tds[3])).strip()
                 arr_dt = _to_dt(clean(tds[5]))
-                st_m = re.search(r'guide-icon\s+([a-zA-Z0-9_-]+)', tds[5])
-                arr_st = st_m.group(1) if st_m else None
+                ber_dt = _to_dt(clean(tds[6]))
+                dep_dt = _to_dt(clean(tds[7]))
+                st_m = lambda cell: (m.group(1) if (m := re.search(r'guide-icon\s+([a-zA-Z0-9_-]+)', cell)) else None)
                 records.append({
                     "vessel": vsl_name,
                     "voyage": vvd[4:8],
@@ -122,7 +132,12 @@ def _extract_vessel_eta_records(html_text):
                     "port": port_nm,
                     "terminal": tmnl_nm,
                     "eta": arr_dt,
-                    "eta_status": arr_st,
+                    "eta_status": st_m(tds[5]),
+                    "etb": ber_dt,
+                    "etb_status": st_m(tds[6]),
+                    "etd": dep_dt,
+                    "etd_status": st_m(tds[7]),
+                    "update_etb_etd": False,
                 })
     return records
 
@@ -167,19 +182,56 @@ def parse_html(path):
     eta_records = _extract_vessel_eta_records(html_text)
     if eta_records:
         edf = pd.DataFrame(eta_records)
-        edf["occ"] = edf.groupby(["vessel", "voyage", "port", "bound", "terminal"]).cumcount()
-        eta_map = {
-            (r.vessel, r.voyage, r.port, r.bound, r.terminal, r.occ): (r.eta, r.eta_status)
+        edf = edf.drop_duplicates(subset=["vessel", "voyage", "port", "bound", "terminal", "eta", "etb"])
+        edf["norm_tmnl"] = edf["terminal"].map(_norm_tmnl)
+        edf["occ"] = edf.groupby(["vessel", "voyage", "port", "bound", "norm_tmnl"]).cumcount()
+        edf["occ_port"] = edf.groupby(["vessel", "voyage", "port", "bound"]).cumcount()
+
+        eta_map_exact = {
+            (r.vessel, r.voyage, r.port, r.bound, r.norm_tmnl, r.occ): r
             for r in edf.itertuples()
         }
+        eta_map_port = {
+            (r.vessel, r.voyage, r.port, r.bound, r.occ_port): r
+            for r in edf.itertuples()
+        }
+        eta_by_vsl_port = {}
+        for r in edf.itertuples():
+            if r.etb is not None and not pd.isna(r.etb):
+                eta_by_vsl_port.setdefault((r.vessel, r.port), []).append(r)
+
         act_mask = df["etb"].notna() | df["skip"]
-        occ_series = df[act_mask].groupby(["vessel", "voyage", "port", "bound", "terminal"]).cumcount()
-        for idx, occ_val in occ_series.items():
+        act_df = df[act_mask].copy()
+        act_df["norm_tmnl"] = act_df["terminal"].map(_norm_tmnl)
+        occ_exact = act_df.groupby(["vessel", "voyage", "port", "bound", "norm_tmnl"]).cumcount()
+        occ_port = act_df.groupby(["vessel", "voyage", "port", "bound"]).cumcount()
+
+        for idx in act_df.index:
             r = df.loc[idx]
-            hit = eta_map.get((r["vessel"], r["voyage"], r["port"], r["bound"], r["terminal"], occ_val))
+            nt = _norm_tmnl(r["terminal"])
+            hit = eta_map_exact.get((r["vessel"], r["voyage"], r["port"], r["bound"], nt, occ_exact.loc[idx]))
+            if hit is None:
+                hit = eta_map_port.get((r["vessel"], r["voyage"], r["port"], r["bound"], occ_port.loc[idx]))
+            if hit is None and pd.notna(r["etb"]):
+                # 회항 종착항(예: BUSAN E)이 by Vessel Name 에서는 다음 항차(W)로 기록되는 경우 ETB 시각으로 매칭
+                candidates = eta_by_vsl_port.get((r["vessel"], r["port"]), [])
+                for cand in candidates:
+                    if abs((pd.Timestamp(cand.etb) - pd.Timestamp(r["etb"])).total_seconds()) <= 48 * 3600:
+                        hit = cand
+                        break
             if hit is not None:
-                df.at[idx, "eta"] = hit[0]
-                df.at[idx, "eta_status"] = hit[1]
+                if hit.eta is not None and not pd.isna(hit.eta):
+                    df.at[idx, "eta"] = hit.eta
+                    df.at[idx, "eta_status"] = hit.eta_status
+                if getattr(hit, "update_etb_etd", False):
+                    if hit.etb is not None and not pd.isna(hit.etb):
+                        df.at[idx, "etb"] = pd.Timestamp(hit.etb)
+                        if hit.etb_status:
+                            df.at[idx, "etb_status"] = hit.etb_status
+                    if hit.etd is not None and not pd.isna(hit.etd):
+                        df.at[idx, "etd"] = pd.Timestamp(hit.etd)
+                        if hit.etd_status:
+                            df.at[idx, "etd_status"] = hit.etd_status
 
     df["eta"] = pd.to_datetime(df["eta"])
     return df
@@ -204,10 +256,11 @@ def normalize_snapshot_filenames(snap_dir):
 
 
 def snapshot_date(path):
-    """파일명 '2026 11월 3일.html' → datetime(2026, 11, 3). 없으면 파일 수정시각."""
-    m = re.search(r"(\d{4})\D*?(\d{1,2})월\s*(\d{1,2})일", Path(path).stem)
+    """파일명 '2026 11월 3일.html' 또는 '2026 11월 10일_140246.html' → datetime. 없으면 파일 수정시각."""
+    m = re.search(r"(\d{4})\D*?(\d{1,2})월\s*(\d{1,2})일(?:_(\d{2})(\d{2})(\d{2}))?", Path(path).stem)
     if m:
-        return datetime(*map(int, m.groups()))
+        y, mo, d, hh, mm, ss = m.groups()
+        return datetime(int(y), int(mo), int(d), int(hh or 0), int(mm or 0), int(ss or 0))
     return datetime.fromtimestamp(Path(path).stat().st_mtime)
 
 
@@ -641,13 +694,255 @@ def _crawl_via_requests(loop_code, include_vessel_eta, report, date_from=None, d
     return _build_loop_html(hdr_list, dtl_list, all_eta_rows)
 
 
+FIM_VESSEL_CODES = {
+    "HMM CLOVER": "HOCV",
+    "HMM DAVAO": "HHDA",
+    "HMM FOREST": "HOFS",
+    "HMM GREEN": "HOGE",
+    "HMM JADE": "HOJD",
+    "HMM LEAF": "HOLF",
+    "HMM LIME": "HOLI",
+    "HMM OAKLAND": "HHOK",
+    "HMM OCEAN": "HTON",
+    "HMM PROMISE": "HHPP",
+    "HMM SAGE": "HOSG",
+    "HMM SKY": "HTSY",
+    "LORRAINE": "HTLR",
+    "SEASPAN BEAUTY": "HTEY",
+    "SEASPAN BELLWETHER": "HTWE",
+    "SEASPAN BREEZE": "HTSB",
+    "SEASPAN BRIGHTNESS": "HTIH",
+    "SEASPAN BRILLIANCE": "HTII",
+}
+
+
+def _launch_hmm_browser(pw, headless=True):
+    """Akamai HTTP/2 및 Headless 탐지를 통과하여 ScheduleMainPost.do 세션을 연다."""
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    )
+    extra_headers = {
+        "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    }
+    candidates = []
+    for use_new_headless in ((True, False) if headless else (False,)):
+        for pw_headless in ((False, True) if use_new_headless else (False,)):
+            for channel in ("chrome", "msedge", None):
+                candidates.append((channel, pw_headless, use_new_headless))
+
+    for channel, pw_headless, use_new_headless in candidates:
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ]
+        if use_new_headless:
+            if not pw_headless:
+                launch_args.append("--headless=new")
+        else:
+            launch_args.append("--window-position=-2400,-2400")
+
+        browser = None
+        try:
+            kwargs = {"headless": pw_headless, "args": launch_args}
+            if channel:
+                kwargs["channel"] = channel
+            browser = pw.chromium.launch(**kwargs)
+            context = browser.new_context(
+                viewport={"width": 1600, "height": 1000},
+                user_agent=ua,
+                locale="ko-KR",
+                extra_http_headers=extra_headers,
+            )
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+            page = context.new_page()
+            page.goto(
+                "https://www.hmm21.com/e-service/general/schedule/ScheduleMainPost.do",
+                wait_until="domcontentloaded",
+                timeout=25000,
+            )
+            page.wait_for_function(
+                "() => typeof comAjaxPromise === 'function' && typeof fnToday === 'function'",
+                timeout=15000,
+            )
+            return browser, page
+        except Exception:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+    raise RuntimeError("HMM e-Service 페이지(ScheduleMainPost.do)에 접속할 수 없습니다.")
+
+
+def _fetch_vessel_all_pages(page, vsl_cd, update_etb_etd=False):
+    """ScheduleMainPost.do 의 'by Vessel Name' 탭(#srchByVesselVslCd)에서 선박을 선택해
+    minPage ~ maxPage 전체 항차의 ETA(arrDt) · ETB(berDt) · ETD(depDt) 를 수집한다.
+    """
+    rows = page.evaluate(
+        """async ({ vslCd }) => {
+            if (typeof $ === 'function' && $('#srchByVesselVslCd').length) {
+                $('#srchByVesselVslCd').val(vslCd);
+            }
+            const callApi = async (pageNo) => {
+                const r = await comAjaxPromise({
+                    url: '/e-service/general/schedule/selectByVesselPagingList.do',
+                    type: 'POST',
+                    contentType: 'application/json; charset=UTF-8',
+                    data: JSON.stringify({ page: String(pageNo), srchByVesselVslCd: vslCd, vvdCd: '' }),
+                    targetId: 'NONE',
+                    callBackFn: 'NONE',
+                    loadingScreen: false
+                });
+                return (r && r.RTN_DATA) ? r.RTN_DATA : null;
+            };
+            const first = await callApi(1);
+            if (!first) return [];
+            const minP = (first.minPage !== null && first.minPage !== undefined) ? Number(first.minPage) : 0;
+            const maxP = (first.maxPage !== null && first.maxPage !== undefined) ? Number(first.maxPage) : 1;
+            let all = [];
+            for (let p = minP; p <= maxP; p++) {
+                const d = (p === 1) ? first : await callApi(p);
+                if (d && Array.isArray(d.boardList)) {
+                    all = all.concat(d.boardList);
+                }
+            }
+            return all;
+        }""",
+        {"vslCd": vsl_cd},
+    )
+    if rows and update_etb_etd:
+        for r in rows:
+            if isinstance(r, dict):
+                r["_update_etb_etd"] = True
+    return rows or []
+
+
+def crawl_by_vessel_name(vessel_names=None, target_snapshot=None,
+                         save_dir=HERE / "snapshots", on_progress=None,
+                         headless=True, update_etb_etd=True):
+    """ScheduleMainPost.do 의 'by Vessel Name' 탭을 통해 선택한 모선들의
+    ETA(arrDt) · ETB(berDt) · ETD(depDt) 를 크롤링하고 스냅샷에 반영한다.
+    """
+    from playwright.sync_api import sync_playwright
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    def report(step, total, msg):
+        if on_progress is not None:
+            on_progress(step, total, msg)
+
+    if not vessel_names:
+        if target_snapshot and Path(target_snapshot).exists():
+            snap_df = parse_html(target_snapshot)
+            vessel_names = list(dict.fromkeys(snap_df["vessel"]))
+        else:
+            vessel_names = list(FIM_VESSEL_CODES.keys())
+
+    report(5, 100, "HMM e-Service (ScheduleMainPost.do › by Vessel Name) 접속 중...")
+    with sync_playwright() as pw:
+        browser, page = _launch_hmm_browser(pw, headless=headless)
+        try:
+            opt_map = page.evaluate(
+                """() => {
+                    const m = {};
+                    if (typeof tab3_opt_json !== 'undefined' && Array.isArray(tab3_opt_json)) {
+                        for (const it of tab3_opt_json) {
+                            if (it.optNm && it.optCd) m[it.optNm.trim().toUpperCase()] = it.optCd.trim();
+                        }
+                    }
+                    return m;
+                }"""
+            ) or {}
+
+            all_rows = []
+            total_v = len(vessel_names)
+            for idx, v_name in enumerate(vessel_names, start=1):
+                v_clean = str(v_name).strip().upper()
+                vsl_cd = opt_map.get(v_clean) or FIM_VESSEL_CODES.get(v_clean)
+                if not vsl_cd:
+                    continue
+                pct = 10 + int(80 * idx / max(total_v, 1))
+                report(pct, 100, f"[by Vessel Name] ({idx}/{total_v}) {v_name} ({vsl_cd}) ETA·ETB·ETD 크롤링 중...")
+                rows = _fetch_vessel_all_pages(page, vsl_cd, update_etb_etd=update_etb_etd)
+                if rows:
+                    all_rows.extend(rows)
+
+            if not all_rows:
+                raise RuntimeError("선택한 선박의 스케줄 데이터를 가져오지 못했습니다.")
+
+            out_path = None
+            if target_snapshot and Path(target_snapshot).exists():
+                report(95, 100, f"{Path(target_snapshot).name} 에 모선별 ETA·ETB·ETD 반영 중...")
+                src_path = Path(target_snapshot)
+                html_text = src_path.read_text(encoding="utf-8", errors="replace")
+                # 기존 JSON 데이터가 있으면 병합
+                existing = []
+                m_old = re.search(
+                    r'<script[^>]*id=["\']hmm-vessel-eta-data["\'][^>]*>(.*?)</script>',
+                    html_text, re.DOTALL | re.IGNORECASE
+                )
+                if m_old:
+                    try:
+                        existing = json.loads(m_old.group(1).strip())
+                    except Exception:
+                        existing = []
+                crawled_vsls = {str(r.get("ltdvds") or "").strip().upper() for r in all_rows}
+                merged = [r for r in existing if str(r.get("ltdvds") or "").strip().upper() not in crawled_vsls]
+                merged.extend(all_rows)
+                script_tag = f'<script id="hmm-vessel-eta-data" type="application/json">{json.dumps(merged, ensure_ascii=False)}</script>'
+                if m_old:
+                    html_text = re.sub(
+                        r'<script[^>]*id=["\']hmm-vessel-eta-data["\'][^>]*>.*?</script>',
+                        lambda _: script_tag,
+                        html_text,
+                        flags=re.DOTALL | re.IGNORECASE,
+                    )
+                elif "</body>" in html_text:
+                    html_text = html_text.replace("</body>", f"{script_tag}</body>", 1)
+                else:
+                    html_text = html_text + script_tag
+                src_path.write_text(html_text, encoding="utf-8")
+                out_path = src_path
+
+            rec_list = []
+            for it in all_rows:
+                vvd = str(it.get("ltdvvd") or "").strip()
+                if len(vvd) < 9:
+                    continue
+                rec_list.append({
+                    "선박명": str(it.get("ltdvds") or "").strip(),
+                    "항차": vvd[4:8],
+                    "방향": vvd[8:9],
+                    "항구": str(it.get("portNm") or "").strip(),
+                    "터미널": str(it.get("tmnlNm") or "").strip(),
+                    "ETA": str(it.get("arrDt") or "").strip(),
+                    "ETA 상태": str(it.get("arrStNm") or "").strip(),
+                    "ETB": str(it.get("berDt") or "").strip(),
+                    "ETB 상태": str(it.get("berStNm") or "").strip(),
+                    "ETD": str(it.get("depDt") or "").strip(),
+                    "ETD 상태": str(it.get("depStNm") or "").strip(),
+                    "Loop": str(it.get("vslSvcLoopCd") or "").strip(),
+                })
+            report(100, 100, f"모선별 ETA·ETB·ETD 크롤링 완료 ({len(rec_list)}개 기항)")
+            return out_path, pd.DataFrame(rec_list)
+        finally:
+            browser.close()
+
+
 def crawl_hmm_schedule(loop_code="FIM", include_vessel_eta=True,
                        save_dir=HERE / "snapshots", on_progress=None, headless=True,
                        date_from=None, date_to=None):
-    """HMM e-Service 에 실제 Chrome(Playwright)으로 접속하여(Akamai TLS/봇 차단 통과):
+    """HMM e-Service (ScheduleMainPost.do) 에 접속하여:
     1) [방식 A] Long-term Schedule by Loop (FIM) 조회 및 테이블 생성
-    2) [방식 B] (include_vessel_eta=True 시) 조회된 모선 순서대로 by Vessel Name API 를 호출해
-       선박별 ETA(Arrival) · ETB · ETD 상세 데이터를 수집하여 HTML 내부에 함께 저장한다.
+    2) [방식 B] (include_vessel_eta=True 시) 'by Vessel Name' 탭을 통해 각 선박의 전체 페이지(minPage~maxPage)에서
+       ETA(Arrival) · ETB(Berthing) · ETD(Departure) 상세 데이터를 수집하여 HTML 내부에 함께 저장한다.
     """
     from playwright.sync_api import sync_playwright
 
@@ -665,62 +960,7 @@ def crawl_hmm_schedule(loop_code="FIM", include_vessel_eta=True,
 
     report(5, 100, "Chrome 브라우저 세션 시작 및 HMM e-Service 접속 중...")
     with sync_playwright() as pw:
-        browser = None
-        page = None
-        for use_new_headless in ((True, False) if headless else (False,)):
-            launch_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ]
-            if use_new_headless:
-                launch_args.append("--headless=new")
-            else:
-                launch_args.append("--window-position=-2400,-2400")
-
-            for pw_headless in ((False, True) if use_new_headless else (False,)):
-                for channel in ("chrome", "msedge", None):
-                    try:
-                        kwargs = {"headless": pw_headless, "args": launch_args}
-                        if channel:
-                            kwargs["channel"] = channel
-                        browser = pw.chromium.launch(**kwargs)
-                        break
-                    except Exception:
-                        continue
-                if browser is not None:
-                    break
-            if browser is None:
-                continue
-
-            try:
-                context = browser.new_context(
-                    viewport={"width": 1600, "height": 1000},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    locale="ko-KR",
-                )
-                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-                page = context.new_page()
-                page.goto(
-                    "https://www.hmm21.com/e-service/general/schedule/ScheduleMain.do",
-                    wait_until="domcontentloaded",
-                    timeout=20000,
-                )
-                page.wait_for_function(
-                    "() => typeof comAjaxPromise === 'function' && typeof fnToday === 'function'",
-                    timeout=15000,
-                )
-                break
-            except Exception:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-                browser = None
-                page = None
-
-        if browser is None or page is None:
-            raise RuntimeError("HMM e-Service 페이지에 접속할 수 없습니다 (네트워크 또는 브라우저 확인).")
+        browser, page = _launch_hmm_browser(pw, headless=headless)
 
         try:
             period_lbl = f"{from_ymd or '오늘'} ~ {to_ymd or '+3개월'}"
@@ -769,50 +1009,21 @@ def crawl_hmm_schedule(loop_code="FIM", include_vessel_eta=True,
 
             all_eta_rows = []
             if include_vessel_eta and loop_info:
-                total_v = len(loop_info)
-                for idx, v in enumerate(loop_info, start=1):
+                # 선박 코드(vslCd) 단위로 중복 없이 minPage ~ maxPage 전체 항차의 ETA/ETB/ETD 를 수집
+                uniq_vsls = []
+                seen_cd = set()
+                for v in loop_info:
+                    if v["vslCd"] not in seen_cd:
+                        seen_cd.add(v["vslCd"])
+                        uniq_vsls.append(v)
+
+                total_v = len(uniq_vsls)
+                for idx, v in enumerate(uniq_vsls, start=1):
                     vsl_cd = v["vslCd"]
                     vsl_nm = v["vslNm"]
-                    voy_no = v["skdVoyNo"]
                     pct = 20 + int(75 * idx / max(total_v, 1))
-                    report(pct, 100, f"[방식 B] ({idx}/{total_v}) {vsl_nm} / {voy_no} ({vsl_cd}) 선박별 ETA 조회 중...")
-
-                    board_list = page.evaluate(
-                        """async ({ vslCd, voyNo }) => {
-                            const callApi = async (pageNo, vvd) => {
-                                const r = await comAjaxPromise({
-                                    url: '/e-service/general/schedule/selectByVesselPagingList.do',
-                                    type: 'POST',
-                                    contentType: 'application/json; charset=UTF-8',
-                                    data: JSON.stringify({ page: String(pageNo), srchByVesselVslCd: vslCd, vvdCd: vvd }),
-                                    targetId: 'NONE',
-                                    callBackFn: 'NONE',
-                                    loadingScreen: false
-                                });
-                                return (r && r.RTN_DATA) ? r.RTN_DATA : null;
-                            };
-                            let data = await callApi(1, vslCd + voyNo);
-                            if (data && data.boardList && data.boardList.length > 0) {
-                                return data.boardList;
-                            }
-                            data = await callApi(1, '');
-                            if (!data || !data.boardList) return [];
-                            let matched = data.boardList.filter(b => (b.ltdvvd || '').substring(4, 8) === voyNo);
-                            if (matched.length > 0) return matched;
-                            const minP = Number(data.minPage || 1);
-                            const maxP = Number(data.maxPage || 1);
-                            for (let p = minP; p <= maxP; p++) {
-                                if (p === 1) continue;
-                                const pData = await callApi(p, '');
-                                if (pData && pData.boardList) {
-                                    matched = pData.boardList.filter(b => (b.ltdvvd || '').substring(4, 8) === voyNo);
-                                    if (matched.length > 0) return matched;
-                                }
-                            }
-                            return [];
-                        }""",
-                        {"vslCd": vsl_cd, "voyNo": voy_no},
-                    )
+                    report(pct, 100, f"[by Vessel Name] ({idx}/{total_v}) {vsl_nm} ({vsl_cd}) ETA·ETB·ETD 조회 중...")
+                    board_list = _fetch_vessel_all_pages(page, vsl_cd, update_etb_etd=True)
                     if board_list:
                         all_eta_rows.extend(board_list)
 

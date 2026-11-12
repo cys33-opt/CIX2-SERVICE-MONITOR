@@ -16,27 +16,29 @@ fs.normalize_snapshot_filenames(SNAP_DIR)
 st.set_page_config(page_title="FIM 스케줄 모니터", layout="wide")
 
 TODAY = datetime.now().date()
+DEFAULT_FROM = TODAY - timedelta(days=145)
 DEFAULT_TO = TODAY + timedelta(days=92)
 
 
 @st.cache_data
-def load(path, mtime, _ver=2):  # mtime: 파일이 바뀌면 캐시 무효화
+def load(path, mtime, _ver=3):  # mtime: 파일이 바뀌면 캐시 무효화
     return fs.parse_html(path)
 
 
 # ── 사이드바: 자동 크롤링 & 스냅샷 관리 ──────────────────────────────
 with st.sidebar:
     st.header("🔄 HMM 자동 크롤링")
-    st.caption("A: FIM 항로(Loop) 전체 표 수집  \nB: 모선별 개별 조회로 ETA(Arrival)까지 함께 수집")
+    st.caption("A: FIM 항로(Loop) 전체 표 수집  \nB: 'by Vessel Name' 탭에서 모선별 ETA·ETB·ETD 수집")
     d_col1, d_col2 = st.columns(2)
-    sb_from = d_col1.date_input("시작 날짜", value=st.session_state.get("crawl_from", TODAY), key="sb_from_dt")
+    sb_from = d_col1.date_input("시작 날짜", value=st.session_state.get("crawl_from", DEFAULT_FROM), key="sb_from_dt")
     sb_to = d_col2.date_input("끝 날짜", value=st.session_state.get("crawl_to", DEFAULT_TO), key="sb_to_dt")
     st.session_state["crawl_from"] = sb_from
     st.session_state["crawl_to"] = sb_to
 
     col_a, col_b = st.columns(2)
     run_a = col_a.button("1️⃣ 방식 A\n(Loop만)", use_container_width=True, help="Long-term Schedule by Loop (FIM) 표만 빠르게 가져옵니다.")
-    run_ab = col_b.button("2️⃣ 방식 A+B\n(Loop+ETA)", type="primary", use_container_width=True, help="FIM 항로 표 조회 후 모선별로 ETA(Arrival)까지 모두 크롤링합니다.")
+    run_ab = col_b.button("2️⃣ 방식 A+B\n(Loop+ETA)", type="primary", use_container_width=True, help="FIM 항로 표 조회 후 'by Vessel Name' 탭에서 모선별 ETA·ETB·ETD를 모두 크롤링합니다.")
+    run_vsl_only = st.button("🚢 현재 스냅샷 모선별 ETA·ETB·ETD 크롤링\n(by Vessel Name 탭)", use_container_width=True, help="ScheduleMainPost.do 의 'by Vessel Name' 탭에서 현재 스냅샷 모선들의 ETA·ETB·ETD를 크롤링하여 반영합니다.")
 
     if run_a or run_ab:
         if sb_from > sb_to:
@@ -52,6 +54,7 @@ with st.sidebar:
                     date_from=sb_from,
                     date_to=sb_to,
                 )
+                st.cache_data.clear()
                 st.success(f"크롤링 및 저장 완료: {saved_path.name}")
                 st.rerun()
             except Exception as exc:
@@ -75,6 +78,22 @@ with st.sidebar:
     others = [f for f in files if f != cur]
     prev = st.selectbox("비교 스냅샷", [None] + others, index=1 if others else 0,
                         format_func=lambda p: "비교 안 함" if p is None else label(p))
+
+    if run_vsl_only:
+        v_prog = st.progress(0, text="by Vessel Name 크롤링 준비 중...")
+        try:
+            updated_path, v_df = fs.crawl_by_vessel_name(
+                target_snapshot=cur,
+                save_dir=SNAP_DIR,
+                on_progress=lambda step, total, msg: v_prog.progress(min(int(step * 100 / max(total, 1)), 100), text=msg),
+                update_etb_etd=True,
+            )
+            st.session_state["last_crawled_vessel_df"] = v_df
+            st.cache_data.clear()
+            st.success(f"모선별 ETA·ETB·ETD 반영 완료: {cur.name} ({len(v_df)}건)")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"모선별 크롤링 실패: {exc}")
 
 df = load(str(cur), cur.stat().st_mtime)
 status = fs.vessel_status(df)
@@ -148,7 +167,7 @@ with tab2:
 with tab3:
     st.subheader("모선별 ETA · ETB · ETD 변경사항 정리 표")
     tc1, tc2, tc3 = st.columns(3)
-    t3_only_chg = tc1.checkbox("변경 항목만 보기 (미변경 모선은 '변경사항 없음' 표시)", value=changes is not None and not changes.empty, key="t3_only")
+    t3_only_chg = tc1.checkbox("변경 항목만 보기 (미변경 모선은 '변경사항 없음' 표시)", value=False, key="t3_only")
     t3_hide_act = tc2.checkbox("지난 실적 숨기기", value=True, key="t3_act")
     only_delay = tc3.checkbox("12시간 이상 지연만 보기", value=False, key="t3_delay")
 
@@ -203,7 +222,7 @@ with tab4:
     vc_map = dict(pd.read_csv(VESSEL_CODES, dtype=str).itertuples(index=False))
     a, b, c = st.columns([4, 1, 1])
     sel = a.multiselect("선박 / 항차", all_voyages, format_func=lambda v: f"{v[0]} / {v[1]}")
-    only = b.checkbox("변경 항목만", value=changes is not None and not changes.empty)
+    only = b.checkbox("변경 항목만", value=False)
     hide_actual = c.checkbox("지난 실적 숨기기", value=True)
     if hide_actual:
         rows = rows[rows["HMM 상태"] != "actual"]
@@ -304,23 +323,66 @@ with tab5:
         st.rerun()
 
 with tab_crawl:
-    st.subheader("🔄 HMM 스케줄 자동 크롤링 (기간 지정)")
+    st.subheader("🚢 1. 'by Vessel Name' 탭 선박 선택 크롤링 (ETA · ETB · ETD)")
     st.caption(
-        "HMM e-Service (`ScheduleMain.do`)에서 **시작 날짜 ~ 끝 날짜** 기간의 FIM 항로 스케줄을 자동으로 수집하여 스냅샷으로 저장합니다."
+        "HMM e-Service (`ScheduleMainPost.do`)의 **'by Vessel Name' 탭**에서 선박을 선택해 **ETA(Arrival) · ETB(Berthing) · ETD(Departure)** 전체 항차를 크롤링하고 현재 기준 스냅샷에 즉시 반영합니다."
+    )
+    with st.container(border=True):
+        cur_vessels = list(dict.fromkeys(df["vessel"]))
+        all_known_vessels = list(dict.fromkeys(cur_vessels + list(fs.FIM_VESSEL_CODES.keys())))
+        picked_vessels = st.multiselect(
+            "크롤링할 선박 선택 (비워두면 현재 스냅샷의 전체 모선을 순서대로 크롤링합니다)",
+            options=all_known_vessels,
+            default=cur_vessels,
+            format_func=lambda v: f"{v} ({fs.FIM_VESSEL_CODES.get(v, '')})" if v in fs.FIM_VESSEL_CODES else v,
+            key="crawl_vessel_pick",
+        )
+        target_vsls = picked_vessels if picked_vessels else cur_vessels
+        if st.button(
+            f"🚢 'by Vessel Name' 탭에서 선택한 선박({len(target_vsls)}척) ETA · ETB · ETD 크롤링 실행",
+            type="primary",
+            use_container_width=True,
+            key="btn_crawl_by_vsl",
+        ):
+            v_prog = st.progress(0, text="ScheduleMainPost.do › by Vessel Name 접속 준비 중...")
+            try:
+                updated_path, v_df = fs.crawl_by_vessel_name(
+                    vessel_names=target_vsls,
+                    target_snapshot=cur,
+                    save_dir=SNAP_DIR,
+                    on_progress=lambda step, total, msg: v_prog.progress(
+                        min(int(step * 100 / max(total, 1)), 100), text=msg
+                    ),
+                    update_etb_etd=True,
+                )
+                st.session_state["last_crawled_vessel_df"] = v_df
+                st.cache_data.clear()
+                st.success(f"'{cur.name}' 스냅샷에 모선별 ETA·ETB·ETD 반영 완료! (총 {len(v_df)}개 기항 수집)")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"by Vessel Name 크롤링 실패: {exc}")
+
+        if "last_crawled_vessel_df" in st.session_state and not st.session_state["last_crawled_vessel_df"].empty:
+            with st.expander("📋 방금 'by Vessel Name' 탭에서 수집된 선박별 ETA · ETB · ETD 원본 표 보기", expanded=True):
+                st.dataframe(st.session_state["last_crawled_vessel_df"], hide_index=True, width="stretch", height=350)
+
+    st.subheader("🔄 2. HMM 항로(Loop) + 모선별(by Vessel Name) 기간 지정 크롤링")
+    st.caption(
+        "HMM e-Service (`ScheduleMainPost.do`)에서 **시작 날짜 ~ 끝 날짜** 기간의 FIM 항로 스케줄과 모선별 ETA·ETB·ETD를 자동으로 수집하여 새 스냅샷으로 저장합니다."
     )
 
     with st.container(border=True):
         st.markdown("##### 📅 조회 기간 선택")
         p1, p2, p3, p4 = st.columns(4)
-        if p1.button("오늘 ~ +1개월", use_container_width=True, key="preset_1m"):
+        if p1.button("전체 운항모선 (-5개월~+3개월)", use_container_width=True, key="preset_all"):
+            st.session_state["tab_from_dt"] = DEFAULT_FROM
+            st.session_state["tab_to_dt"] = DEFAULT_TO
+            st.rerun()
+        if p2.button("오늘 ~ +1개월", use_container_width=True, key="preset_1m"):
             st.session_state["tab_from_dt"] = TODAY
             st.session_state["tab_to_dt"] = TODAY + timedelta(days=31)
             st.rerun()
-        if p2.button("오늘 ~ +2개월", use_container_width=True, key="preset_2m"):
-            st.session_state["tab_from_dt"] = TODAY
-            st.session_state["tab_to_dt"] = TODAY + timedelta(days=62)
-            st.rerun()
-        if p3.button("오늘 ~ +3개월 (기본)", use_container_width=True, key="preset_3m"):
+        if p3.button("오늘 ~ +3개월", use_container_width=True, key="preset_3m"):
             st.session_state["tab_from_dt"] = TODAY
             st.session_state["tab_to_dt"] = DEFAULT_TO
             st.rerun()
@@ -354,7 +416,7 @@ with tab_crawl:
             key="tab_btn_a",
         )
         t_run_ab = bc2.button(
-            "2️⃣ 방식 A+B 크롤링 시작 (FIM Loop + 모선별 ETA 전체 수집)",
+            "2️⃣ 방식 A+B 크롤링 시작 (FIM Loop + by Vessel Name ETA·ETB·ETD 전체 수집)",
             type="primary",
             use_container_width=True,
             disabled=days_diff < 0,
@@ -374,6 +436,7 @@ with tab_crawl:
                     date_from=t_from,
                     date_to=t_to,
                 )
+                st.cache_data.clear()
                 st.success(f"크롤링 및 저장 완료: {saved_path.name}")
                 st.rerun()
             except Exception as exc:
